@@ -1,13 +1,12 @@
 # LLM Configuration
 OPENAI_API_KEY=""
-
 OPENAI_BASE_URL=https://api.openai.com/v1
 MODEL_NAME=gpt-5.2
 
-# Server URLs
-SERVER_URL=http://localhost:8000
-INTERNAL_API_URL=http://host.docker.internal:8080
-PUBLIC_DOMAIN=http://localhost:8080
+# Subprocess
+SCRIPT_TIMEOUT=90
 
 # Open WebUI
+INTERNAL_API_URL=http://host.docker.internal:8080
+PUBLIC_DOMAIN=http://localhost:8080
 OPENWEBUI_API_KEY=""

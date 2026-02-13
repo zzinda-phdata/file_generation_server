@@ -1,29 +1,39 @@
-# Excel Agent
+# File Agent
 
 ## What This Is
 
-A FastAPI service that takes natural language instructions, uses an LLM to generate Python/xlsxwriter code, executes it in a sandboxed subprocess, and uploads the resulting Excel file to Open WebUI.
+A FastAPI service that takes natural language instructions, uses an LLM to generate Python code (xlsxwriter for Excel, python-docx for Word), executes it in a sandboxed subprocess, and uploads the resulting file to Open WebUI.
 
 ## Architecture
 
 ```
-User/Open WebUI  -->  POST /generate-excel  -->  LLM generates xlsxwriter code
-                                              -->  Code runs in isolated subprocess
-                                              -->  .xlsx uploaded to Open WebUI
-                                              -->  Download URL returned
+User/Open WebUI  -->  POST /generate-file        -->  LLM generates Python code
+                      (file_type: excel | docx)        (xlsxwriter or python-docx)
+                                                  -->  Code runs in isolated subprocess
+                                                  -->  .xlsx/.docx uploaded to Open WebUI
+                                                  -->  Download URL returned
 ```
 
 Single file app (`main.py`) with these key components:
 
-- **`generate_code()`** — Calls LLM (OpenAI-compatible API) to produce raw Python code
+- **`generate_code()`** — Calls LLM (OpenAI-compatible API) to produce raw Python code using the appropriate system prompt
 - **`extract_code()`** — Strips markdown fences if LLM ignores formatting rules
 - **`run_code_in_subprocess()`** — Executes LLM code in a subprocess with a stripped environment (no API keys), enforced timeout, and `file_path` reassignment stripping
 - **`upload_file()`** — Async upload to Open WebUI's `/api/v1/files/` endpoint via aiohttp
-- **`generate_excel()`** — The endpoint; orchestrates a self-healing retry loop (up to 3 retries)
+- **`generate_file()`** — The unified endpoint; orchestrates a self-healing retry loop (up to 3 retries) for any supported file type
+- **`FILE_TYPE_CONFIG`** — Dict mapping file types to their extension, system prompt, and label
+
+## Supported File Types
+
+| `file_type` | Library | Extension | System Prompt |
+|---|---|---|---|
+| `excel` | xlsxwriter | `.xlsx` | `EXCEL_SYSTEM_PROMPT` |
+| `docx` | python-docx | `.docx` | `DOCX_SYSTEM_PROMPT` |
 
 ## Key Design Decisions
 
-- **Subprocess sandboxing**: LLM-generated code runs via `subprocess.run([sys.executable, script_path])` with `env={"PATH": ...}` only. This prevents the generated code from accessing API keys or server env vars.
+- **Unified endpoint**: A single `POST /generate-file` endpoint handles all file types via the `file_type` request field and `FILE_TYPE_CONFIG` lookup. Adding a new file type requires only a new system prompt and config entry.
+- **Subprocess sandboxing**: LLM-generated code runs via `asyncio.create_subprocess_exec(sys.executable, script_path)` with `env={"PATH": ...}` only. This prevents the generated code from accessing API keys or server env vars.
 - **`sys.executable`** is used instead of `"python"` so the subprocess uses the same interpreter (and installed packages) as the app.
 - **`file_path` stripping**: LLMs often redefine `file_path` in generated code despite instructions not to. A regex strips `file_path = ...` lines before prepending the correct assignment.
 - **Non-root Docker user**: The container runs as `appuser`, not root.
@@ -68,10 +78,11 @@ Configured in `.env` (gitignored). See `.sample_env` for the template.
 | `main.py` | Entire application |
 | `Dockerfile` | Python 3.11-slim, non-root user, Gunicorn |
 | `compose.yaml` | Docker Compose config, loads `.env` |
-| `requirements.txt` | Python dependencies |
+| `requirements.txt` | Python dependencies (xlsxwriter, python-docx, etc.) |
 | `.env` | Real config (gitignored) |
 | `.sample_env` | Template for `.env` |
 | `.gitignore` | Excludes `.env` |
+| `.dockerignore` | Excludes `.git`, `.env`, etc. from Docker build |
 
 ## Common Issues
 
