@@ -5,12 +5,14 @@ import uuid
 import logging
 import re
 import tempfile
-from typing import Any, Optional
+from typing import Any
 import aiohttp
 import uvicorn
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from openai import AsyncOpenAI
 
 # --- LOGGING ---
@@ -22,18 +24,20 @@ log.addHandler(_handler)
 log.propagate = False
 
 # --- CONFIGURATION ---
-app = FastAPI(title="OpenWebUI File Agent", version="2.0.0")
+mcp = FastMCP("FileAgent")
 
 # Temporary directory for generated files
 STORAGE_DIR = tempfile.mkdtemp(prefix="owui_files_")
 SCRIPT_TIMEOUT = int(os.getenv("SCRIPT_TIMEOUT", "90"))
+# These fire at module import — once per gunicorn worker when running multi-worker
 log.info(f"STORAGE_DIR = {STORAGE_DIR}")
 log.info(f"SCRIPT_TIMEOUT = {SCRIPT_TIMEOUT}")
 log.info(f"Python executable = {sys.executable}")
 
 client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY", "sk-placeholder"),
-    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    timeout=120.0,
 )
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 
@@ -70,25 +74,11 @@ FILE_TYPE_CONFIG: dict[str, dict[str, Any]] = {
     "docx":  {"ext": ".docx", "system_prompt": DOCX_SYSTEM_PROMPT, "label": "Word"},
 }
 
-# --- DATA MODELS ---
-class InstructionRequest(BaseModel):
-    """Incoming request to generate a file from natural language instructions."""
-    instructions: str = Field(description="Natural language description of the file to generate")
-    filename_hint: Optional[str] = Field("output", description="Base name for the generated file (UUID suffix added automatically)")
-    file_type: Optional[str] = Field("excel", description="File type to generate: 'excel' or 'docx'")
-
-class FileResponse(BaseModel):
-    """Response returned after file generation and upload."""
-    status: str = Field(description="'success' or HTTP error status")
-    download_url: str = Field(description="URL to download the generated file from Open WebUI")
-    message: str = Field(description="Human-readable result message")
-    attempts: int = Field(description="Number of generation attempts used (1 = first try)")
-
 # --- HELPER FUNCTIONS ---
 
 def extract_code(llm_response: str) -> str:
     """Clean markdown code blocks if the LLM ignores instructions."""
-    pattern = r"```python(.*?)```"
+    pattern = r"```(?:python)?(.*?)```"
     match = re.search(pattern, llm_response, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -194,8 +184,7 @@ async def run_code_in_subprocess(code: str, file_path: str) -> None:
 async def upload_file(local_path: str, filename: str) -> str:
     """Upload a generated file to Open WebUI and return a public download URL.
 
-    Returns a URL string on success, or an error string prefixed with
-    "Upload Error" or "System Error" on failure.
+    Raises on failure so the retry loop can catch and self-correct.
     """
     internal_api_url = os.getenv("INTERNAL_API_URL", "http://localhost:8080")
     public_domain = os.getenv("PUBLIC_DOMAIN", "http://localhost:8080")
@@ -203,76 +192,79 @@ async def upload_file(local_path: str, filename: str) -> str:
     headers = {"Authorization": f"Bearer {api_key}"}
     upload_url = f"{internal_api_url.rstrip('/')}/api/v1/files/"
 
-    try:
-        form = aiohttp.FormData()
-        form.add_field("file", open(local_path, "rb"), filename=filename)
-
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60)
-        ) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=60)
+    ) as session:
+        with open(local_path, "rb") as f:
+            form = aiohttp.FormData()
+            form.add_field("file", f, filename=filename)
             async with session.post(upload_url, headers=headers, data=form) as resp:
                 status = resp.status
                 text = await resp.text()
                 try:
                     data = await resp.json()
-                except:
+                except Exception:
                     data = {}
 
-        try:
-            os.remove(local_path)
-        except:
-            pass
+    try:
+        os.remove(local_path)
+    except Exception:
+        pass
 
-        if status < 200 or status >= 300:
-            return f"Upload Error {status}: {text}"
-        file_id = data.get("id") or data.get("uuid") or data.get("file_id")
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"Upload failed (HTTP {status}): {text}")
 
-        download_url = f"{public_domain.rstrip('/')}/api/v1/files/{file_id}/content"
+    file_id = data.get("id") or data.get("uuid") or data.get("file_id")
+    return f"{public_domain.rstrip('/')}/api/v1/files/{file_id}/content"
 
-        return download_url
-    except Exception as e:
-        return f"System Error: {str(e)}"
+# --- MCP TOOL ---
 
-# --- THE ENDPOINTS ---
+@mcp.tool
+async def generate_file(
+    instructions: str,
+    file_type: str = "excel",
+    filename_hint: str = "output",
+) -> str:
+    """Generate an Excel or Word file from natural language instructions.
 
-@app.post("/generate-file", response_model=FileResponse, operation_id="generateFile")
-async def generate_file(request: InstructionRequest) -> FileResponse:
-    """
-    Takes user instructions and a file_type ("excel" or "docx"), generates Python
-    code to build the file, executes it, and returns a download link.
-    Self-corrects if code fails.
+    Takes user instructions and a file_type, generates Python code to build
+    the file, executes it in a sandbox, uploads to Open WebUI, and returns
+    a download link. Self-corrects if code generation fails.
+
+    Args:
+        instructions: Natural language description of the file to generate.
+        file_type: File type to generate: 'excel' or 'docx'.
+        filename_hint: Base name for the generated file (UUID suffix added automatically).
     """
 
     # 0. Validate file_type
-    file_type = request.file_type
     if file_type not in FILE_TYPE_CONFIG:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file_type '{file_type}'. Must be one of: {', '.join(FILE_TYPE_CONFIG)}"
+        raise ToolError(
+            f"Unsupported file_type '{file_type}'. Must be one of: {', '.join(FILE_TYPE_CONFIG)}"
         )
     config = FILE_TYPE_CONFIG[file_type]
 
     # 1. Setup paths
-    filename = f"{request.filename_hint}_{uuid.uuid4().hex[:8]}{config['ext']}"
+    filename = f"{filename_hint}_{uuid.uuid4().hex[:8]}{config['ext']}"
     file_path = os.path.join(STORAGE_DIR, filename)
 
     # 2. The Healing Loop
-    max_retries = 3
+    max_attempts = 4
     current_code = ""
     last_error = ""
 
-    log.info(f"=== New {config['label']} request: '{request.instructions}' | file: {filename} ===")
+    log.info(f"=== New {config['label']} request: '{instructions}' | file: {filename} ===")
     log.info(f"Target path: {file_path}")
 
-    for attempt in range(max_retries + 1):
+    for attempt in range(max_attempts):
         try:
             # A. Generate Code (Fresh or Fix)
             if attempt == 0:
-                log.info(f"--- Attempt {attempt}: fresh generation ---")
-                current_code = await generate_code(request.instructions, file_path, config["system_prompt"])
+                log.info(f"--- Attempt {attempt + 1}/{max_attempts}: fresh generation ---")
+                current_code = await generate_code(instructions, file_path, config["system_prompt"])
             else:
-                log.info(f"--- Attempt {attempt}: self-correction (error: {last_error}) ---")
-                current_code = await generate_code(request.instructions, file_path, config["system_prompt"], last_error, current_code)
+                log.info(f"--- Attempt {attempt + 1}/{max_attempts}: self-correction (error: {last_error}) ---")
+                current_code = await generate_code(instructions, file_path, config["system_prompt"], last_error, current_code)
 
             # B. Execute in isolated subprocess
             await run_code_in_subprocess(current_code, file_path)
@@ -287,30 +279,42 @@ async def generate_file(request: InstructionRequest) -> FileResponse:
             # D. Upload to Open WebUI
             log.info(f"Uploading {filename} to Open WebUI...")
             download_url = await upload_file(file_path, filename)
-            if download_url.startswith(("Upload Error", "System Error")):
-                log.error(f"Upload failed: {download_url}")
-                raise Exception(download_url)
 
             log.info(f"Success on attempt {attempt + 1}: {download_url}")
-            return FileResponse(
-                status="success",
-                download_url=download_url,
-                message=f"{config['label']} file generated successfully.",
-                attempts=attempt + 1
+            return (
+                f"{config['label']} file generated successfully "
+                f"(attempt {attempt + 1} of {max_attempts}).\n"
+                f"Download: {download_url}"
             )
 
+        except ToolError:
+            raise
         except Exception as e:
             last_error = str(e)
-            log.error(f"Attempt {attempt} failed: {last_error}", exc_info=True)
+            log.error(f"Attempt {attempt + 1} failed: {last_error}", exc_info=True)
+            # Clean up partial output file before retrying
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
-    # 3. Failure after retries
-    log.error(f"All {max_retries + 1} attempts exhausted. Last error: {last_error}")
-    raise HTTPException(status_code=500, detail=f"Failed to generate valid {config['label']} file after {max_retries} attempts. Last error: {last_error}")
+    # 3. Failure after all attempts
+    log.error(f"All {max_attempts} attempts exhausted. Last error: {last_error}")
+    raise ToolError(
+        f"Failed to generate valid {config['label']} file after {max_attempts} attempts. "
+        f"Last error: {last_error}"
+    )
 
-@app.get("/health", operation_id="healthCheck")
-async def health() -> dict[str, str]:
+# --- HEALTH CHECK ---
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
     """Health check endpoint for orchestrators and monitoring."""
-    return {"status": "ok"}
+    return JSONResponse({"status": "ok"})
+
+# --- ASGI APP ---
+
+app = mcp.http_app(path="/mcp", stateless_http=True)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

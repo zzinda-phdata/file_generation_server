@@ -10,3 +10,5 @@ SCRIPT_TIMEOUT=90
 INTERNAL_API_URL=http://host.docker.internal:8080
 PUBLIC_DOMAIN=http://localhost:8080
 OPENWEBUI_API_KEY=""
+
+# MCP endpoint: http://<host>:8000/mcp — configure in Open WebUI Admin Settings
