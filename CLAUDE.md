@@ -31,15 +31,19 @@ Single file app (`main.py`) with these key components:
 
 - **`generate_code()`** — Calls LLM (OpenAI-compatible API) to produce raw Python code using the appropriate system prompt
 - **`extract_code()`** — Strips markdown fences if LLM ignores formatting rules
+- **`_llm_call()`** — Thin wrapper around `client.chat.completions.create()` with retry logic (2 retries, exponential backoff) for transient API failures. Used by all analysis LLM calls.
+- **`_truncate_output()`** — Truncates subprocess output to `MAX_ANALYSIS_OUTPUT_CHARS` (30,000) before feeding to LLM context. Full output preserved in audit trail.
+- **`_inspect_file()`** — Runs a deterministic (not LLM-generated) inspection script before analysis. Captures shape, dtypes, sample rows, null counts, sheet names (Excel), and header offset detection via openpyxl raw row inspection. Result injected into the first LLM message.
+- **`_parse_checker_result()`** — Parses checker LLM response into `(status, content)` tuple. Handles missing markers gracefully.
 - **`run_code_in_subprocess()`** — Executes LLM code in a subprocess with a stripped environment (no API keys), enforced timeout, and `file_path`/`input_file_path` reassignment stripping
-- **`run_analysis_code()`** — Like `run_code_in_subprocess()` but returns captured stdout instead of writing files; used by `analyze_file`
+- **`run_analysis_code()`** — Like `run_code_in_subprocess()` but returns captured stdout (with meaningful stderr warnings appended) instead of writing files; used by `analyze_file`
 - **`upload_file()`** — Async upload to Open WebUI's `/api/v1/files/` endpoint via aiohttp
 - **`download_file()`** — Async download from Open WebUI's `/api/v1/files/{id}/content` endpoint; detects file type from response headers
 - **`generate_file()`** — MCP tool for creating new files; orchestrates a self-healing retry loop (up to 3 retries)
 - **`modify_file()`** — MCP tool for modifying existing files; downloads the original, runs a self-healing retry loop, uploads the result
-- **`analyze_file()`** — MCP tool for analyzing CSV/Excel files; agentic multi-round loop with checker sub-agent, returns text
-- **`_run_checker()`** — Sub-agent that verifies analysis results; returns `__CHECK_PASSED__` or `__CHECK_FAILED__`
-- **`_run_analysis_redo()`** — Re-runs analysis with checker feedback when the checker flags issues
+- **`analyze_file()`** — MCP tool for analyzing CSV/Excel files; runs data inspection, then agentic multi-round loop with checker sub-agent. Returns analysis results with QA section and full methodology audit trail (including timing).
+- **`_run_checker()`** — Sub-agent that verifies analysis results; returns `(status, content)` where status is `'passed'`, `'failed'`, or `'unknown'`
+- **`_run_analysis_redo()`** — Re-runs analysis with checker feedback when the checker flags issues. Records failed execution attempts in the audit trail instead of silently dropping them.
 - **`FILE_TYPE_CONFIG`** — Dict mapping file types to their extension, system prompts (create and modify), and label
 
 ## MCP Tools
@@ -80,9 +84,10 @@ analyze_file(file_id: str, instructions: str) -> str
 - `file_id` — The Open WebUI file ID of the file to analyze
 - `instructions` — Natural language description of the analysis to perform
 - Supports CSV (`.csv`) and Excel (`.xlsx`) files
+- Runs a deterministic data inspection first (shape, dtypes, sample rows, null counts, sheet names, header offset detection) and injects results into the LLM's first message
 - Uses an agentic multi-round loop (up to 3 rounds) where the LLM generates pandas code, sees output, and decides what to analyze next
 - A checker sub-agent verifies results; can request one redo if issues are found
-- Returns analysis results as natural language, followed by a methodology section with all code and outputs for auditability
+- Returns: Analysis Results section, Quality Assurance section (checker status, round count, timing), and Methodology section (data inspection + all code and outputs with execution timing) for auditability
 - Raises `ToolError` for download failures, unsupported file types, or failed analysis
 
 ## Supported File Types
@@ -104,8 +109,13 @@ analyze_file(file_id: str, instructions: str) -> str
 - **`sys.executable`** is used instead of `"python"` so the subprocess uses the same interpreter (and installed packages) as the app.
 - **`file_path` / `input_file_path` stripping**: LLMs often redefine path variables in generated code despite instructions not to. Regexes strip `file_path = ...` and `input_file_path = ...` lines before prepending the correct assignments.
 - **Two-path subprocess design**: The modification flow injects both `input_file_path` (read-only original) and `file_path` (output) into the subprocess. This keeps the original intact for retry safety — only the output file is deleted between attempts.
-- **Agentic analysis loop**: `analyze_file` uses a fundamentally different pattern from the other tools. Instead of a single-shot retry loop, it runs a multi-round conversation: generate code → run it → feed output back to LLM → LLM decides whether to continue or signal `__ANALYSIS_COMPLETE__`. Each round has its own error retry budget.
-- **Checker sub-agent**: After the analysis loop, a separate LLM call reviews the work using `ANALYSIS_CHECKER_SYSTEM_PROMPT`. If it returns `__CHECK_FAILED__`, the analysis is redone once with the checker's feedback; the second result is accepted regardless.
+- **Pre-analysis data inspection**: Before the agentic loop, `_inspect_file()` runs a deterministic script (not LLM-generated) that captures file metadata: shape, dtypes, sample rows, null counts, and for Excel files, sheet names and raw row inspection via openpyxl to detect header offsets (metadata rows above the actual data). This is injected into the first LLM message so it generates correct code on the first attempt. Included as "Step 0" in the methodology audit trail.
+- **LLM call retry wrapper**: `_llm_call()` wraps all analysis LLM calls with retry logic (2 retries, exponential backoff at 1s/3s) for transient API failures (APIError, APIConnectionError, RateLimitError).
+- **Output truncation**: `_truncate_output()` caps subprocess output to `MAX_ANALYSIS_OUTPUT_CHARS` (30,000 chars) before sending to LLM context. Full untruncated output is preserved in the `steps[]` list for the methodology audit trail.
+- **Agentic analysis loop**: `analyze_file` uses a fundamentally different pattern from the other tools. Instead of a single-shot retry loop, it runs a multi-round conversation: generate code → run it → feed output back to LLM → LLM decides whether to continue or signal `__ANALYSIS_COMPLETE__`. Each round has its own error retry budget. Error fix prompts include the data inspection context for better self-correction.
+- **Checker sub-agent**: After the analysis loop, a separate LLM call reviews the work using `ANALYSIS_CHECKER_SYSTEM_PROMPT`. Response is parsed by `_parse_checker_result()` into `(status, content)`. If status is `"failed"`, the analysis is redone once with the checker's feedback. Failed redo attempts are recorded in the audit trail (not silently dropped). The second result is accepted regardless.
+- **QA section**: The analysis output includes a Quality Assurance section showing checker status (PASSED / PASSED after correction / ACCEPTED WITH CAVEATS), round count, execution timing, and a note if max rounds were reached without explicit completion.
+- **Stderr warnings**: `run_analysis_code()` appends meaningful stderr warnings (filtering out FutureWarning/DeprecationWarning noise) to the returned output. This helps the LLM see and fix pandas warnings in subsequent rounds.
 - **Analysis returns text, not files**: Unlike `generate_file` and `modify_file`, `analyze_file` captures subprocess stdout and returns it as text. It does not upload any files.
 - **Non-root Docker user**: The container runs as `appuser`, not root.
 - **Gunicorn timeout**: Set to 300s to accommodate complex prompts that require multiple LLM round-trips.
