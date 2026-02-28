@@ -33,25 +33,44 @@ Open WebUI  -->  MCP tool call: conduct_deep_research()  -->  OpenAI Responses A
                                                           -->  Research report returned as text
 ```
 
-Single file app (`main.py`) with these key components:
+Modular design with five Python files:
 
-- **`generate_code()`** — Calls LLM (OpenAI-compatible API) to produce raw Python code using the appropriate system prompt
-- **`extract_code()`** — Strips markdown fences if LLM ignores formatting rules
-- **`_llm_call()`** — Thin wrapper around `client.chat.completions.create()` with retry logic (2 retries, exponential backoff) for transient API failures. Used by all analysis LLM calls.
-- **`_truncate_output()`** — Truncates subprocess output to `MAX_ANALYSIS_OUTPUT_CHARS` (30,000) before feeding to LLM context. Full output preserved in audit trail.
-- **`_inspect_file()`** — Runs a deterministic (not LLM-generated) inspection script before analysis. Captures shape, dtypes, sample rows, null counts, sheet names (Excel), and header offset detection via openpyxl raw row inspection. Result injected into the first LLM message.
-- **`_parse_checker_result()`** — Parses checker LLM response into `(status, content)` tuple. Handles missing markers gracefully.
-- **`run_code_in_subprocess()`** — Executes LLM code in a subprocess with a stripped environment (no API keys), enforced timeout, and `file_path`/`input_file_path` reassignment stripping
-- **`run_analysis_code()`** — Like `run_code_in_subprocess()` but returns captured stdout (with meaningful stderr warnings appended) instead of writing files; used by `analyze_file`
-- **`upload_file()`** — Async upload to Open WebUI's `/api/v1/files/` endpoint via aiohttp
-- **`download_file()`** — Async download from Open WebUI's `/api/v1/files/{id}/content` endpoint; detects file type from response headers
-- **`generate_file()`** — MCP tool for creating new files; orchestrates a self-healing retry loop (up to 3 retries)
-- **`modify_file()`** — MCP tool for modifying existing files; downloads the original, runs a self-healing retry loop, uploads the result
-- **`analyze_file()`** — MCP tool for analyzing CSV/Excel files; runs data inspection, then agentic multi-round loop with checker sub-agent. Returns analysis results with QA section and full methodology audit trail (including timing).
-- **`_run_checker()`** — Sub-agent that verifies analysis results; returns `(status, content)` where status is `'passed'`, `'failed'`, or `'unknown'`
-- **`_run_analysis_redo()`** — Re-runs analysis with checker feedback when the checker flags issues. Records failed execution attempts in the audit trail instead of silently dropping them.
-- **`conduct_deep_research()`** — MCP tool for deep research; uses the OpenAI Responses API with `o4-mini-deep-research` model and web search. Polls for completion in background mode. Returns research report with source citations.
-- **`FILE_TYPE_CONFIG`** — Dict mapping file types to their extension, system prompts (create and modify), and label
+- **`main.py`** — Thin entry point. Imports tool modules to trigger `@mcp.tool` registration, adds health check route, exports ASGI app.
+- **`config.py`** — All configuration: logging, `mcp` instance, `client` instance, constants, all 7 system prompts, `FILE_TYPE_CONFIG`.
+- **`helpers.py`** — Shared utility functions used by tools and analysis modules.
+- **`tools.py`** — `generate_file`, `modify_file`, `conduct_deep_research` MCP tools.
+- **`analysis.py`** — `analyze_file` MCP tool and its sub-agents (`_inspect_file`, `_run_checker`, `_run_analysis_redo`).
+
+Import dependency graph (no circular dependencies):
+```
+config.py  (no internal imports)
+    ↑
+helpers.py (imports from config)
+    ↑
+tools.py & analysis.py (import from config + helpers)
+    ↑
+main.py (imports config.mcp, then imports tools & analysis to trigger registration)
+```
+
+Key components:
+
+- **`generate_code()`** *(helpers)* — Calls LLM to produce raw Python code using the appropriate system prompt
+- **`extract_code()`** *(helpers)* — Strips markdown fences if LLM ignores formatting rules
+- **`_llm_call()`** *(helpers)* — Wrapper around `client.chat.completions.create()` with retry logic (2 retries, exponential backoff) for transient API failures
+- **`_truncate_output()`** *(helpers)* — Truncates subprocess output to `MAX_ANALYSIS_OUTPUT_CHARS` (30,000) before feeding to LLM context
+- **`_parse_checker_result()`** *(helpers)* — Parses checker LLM response into `(status, content)` tuple
+- **`run_code_in_subprocess()`** *(helpers)* — Executes LLM code in a subprocess with a stripped environment (no API keys), enforced timeout, and `file_path`/`input_file_path` reassignment stripping
+- **`run_analysis_code()`** *(helpers)* — Like `run_code_in_subprocess()` but returns captured stdout (with meaningful stderr warnings appended)
+- **`upload_file()`** *(helpers)* — Async upload to Open WebUI's `/api/v1/files/` endpoint
+- **`download_file()`** *(helpers)* — Async download from Open WebUI's `/api/v1/files/{id}/content` endpoint; detects file type from response headers
+- **`generate_file()`** *(tools)* — MCP tool for creating new files; self-healing retry loop (up to 3 retries)
+- **`modify_file()`** *(tools)* — MCP tool for modifying existing files; downloads the original, runs a self-healing retry loop, uploads the result
+- **`analyze_file()`** *(analysis)* — MCP tool for analyzing CSV/Excel files; runs data inspection, then agentic multi-round loop with checker sub-agent
+- **`_inspect_file()`** *(analysis)* — Runs a deterministic inspection script before analysis (shape, dtypes, sample rows, null counts, sheet names, header offset detection)
+- **`_run_checker()`** *(analysis)* — Sub-agent that verifies analysis results
+- **`_run_analysis_redo()`** *(analysis)* — Re-runs analysis with checker feedback
+- **`conduct_deep_research()`** *(tools)* — MCP tool for deep research via OpenAI Responses API with background polling
+- **`FILE_TYPE_CONFIG`** *(config)* — Dict mapping file types to their extension, system prompts, and label
 
 ## MCP Tools
 
@@ -200,7 +219,11 @@ Configured in `.env` (gitignored). See `.sample_env` for the template.
 
 | File | Purpose |
 |---|---|
-| `main.py` | Entire application |
+| `main.py` | Entry point — imports modules, health check, ASGI app export |
+| `config.py` | Logging, constants, system prompts, LLM client, FastMCP instance, `FILE_TYPE_CONFIG` |
+| `helpers.py` | Shared utilities — code generation, subprocess execution, file upload/download |
+| `tools.py` | MCP tools: `generate_file`, `modify_file`, `conduct_deep_research` |
+| `analysis.py` | MCP tool: `analyze_file` + sub-agents (`_inspect_file`, `_run_checker`, `_run_analysis_redo`) |
 | `Dockerfile` | Python 3.11-slim, non-root user, Gunicorn |
 | `compose.yaml` | Docker Compose config, loads `.env` |
 | `requirements.txt` | Python dependencies (fastmcp, xlsxwriter, openpyxl, python-docx, pandas, etc.) |
