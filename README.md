@@ -44,6 +44,17 @@ Modify an existing Excel or Word file.
 | `instructions` | string | *(required)* | Natural language description of the modifications to make |
 | `filename_hint` | string | `"modified"` | Base filename (a UUID suffix is added automatically) |
 
+### `analyze_file`
+
+Analyze a CSV or Excel file using an agentic multi-round approach with a checker sub-agent.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `file_id` | string | *(required)* | The Open WebUI file ID of the file to analyze |
+| `instructions` | string | *(required)* | Natural language description of the analysis to perform |
+
+Returns natural language analysis results followed by a methodology section with all code and outputs for auditability. The tool runs up to 3 rounds of analysis and includes a checker sub-agent that verifies results.
+
 ## Prerequisites
 
 - **Docker** and **Docker Compose** or **Podman**

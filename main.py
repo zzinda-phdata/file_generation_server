@@ -110,10 +110,74 @@ RULES:
 8. Preserve existing content and formatting unless the user explicitly asks to change or remove it.
 """
 
+ANALYSIS_SYSTEM_PROMPT = """
+You are an expert Python data analyst. Your goal is to write a Python script using pandas to analyze a data file and print the results.
+
+RULES:
+1. A variable named `input_file_path` will be provided at runtime. Use it to read the file.
+2. Detect the file type from the extension:
+   - `.csv`: use `pd.read_csv(input_file_path)`
+   - `.xlsx` or `.xls`: use `pd.read_excel(input_file_path)`
+3. Print ALL analysis results to stdout using `print()`. This is how your results are captured.
+4. Start by printing a brief summary of the data (shape, columns, dtypes) before the main analysis.
+5. Do NOT redefine `input_file_path`.
+6. Do NOT output markdown formatting (like ```python). Output ONLY raw Python code.
+7. Do NOT create or save any files. Only print results.
+8. Use pandas, and standard library modules only.
+9. Format numerical output clearly (e.g., round floats, align columns where helpful).
+"""
+
+ANALYSIS_FOLLOWUP_SYSTEM_PROMPT = """
+You are an expert Python data analyst continuing a multi-step analysis.
+
+You will receive the code and output from previous analysis steps. Based on these results and the user's original instructions, decide what to do:
+
+OPTION A — If the analysis is COMPLETE and fully addresses the user's instructions:
+  Output ONLY the text: __ANALYSIS_COMPLETE__
+  Do NOT output any code.
+
+OPTION B — If more analysis is needed:
+  Output ONLY raw Python code (no markdown fences) for the next analysis step.
+  The variable `input_file_path` is already defined. Do NOT redefine it.
+  Print all results to stdout using `print()`.
+  Do NOT create or save any files.
+  Use pandas, and standard library modules only.
+
+Choose Option A when the previous output already contains enough information to fully answer the user's question. Do not run unnecessary extra steps.
+"""
+
+ANALYSIS_CHECKER_SYSTEM_PROMPT = """
+You are a senior data analyst reviewing another analyst's work. You will receive:
+- The original analysis instructions
+- All code that was executed (each step)
+- All output produced (each step)
+
+Your job is to verify the analysis is correct and complete.
+
+RULES:
+1. Check that the analysis actually addresses the user's instructions.
+2. Check for logical errors, misinterpretations, or incorrect calculations.
+3. Check that conclusions are supported by the data shown in the output.
+
+If the analysis is CORRECT and COMPLETE:
+  Start your response with: __CHECK_PASSED__
+  Then write a polished, natural language summary of the analysis results.
+  This summary should be clear, well-organized, and directly answer the user's question.
+  Do NOT include code in this summary.
+
+If there are SIGNIFICANT issues (wrong answers, missing key parts of the instructions, logical errors):
+  Start your response with: __CHECK_FAILED__
+  Then describe the specific issues that need to be fixed.
+  Be concrete: say what is wrong and what the correct approach should be.
+
+Minor formatting issues or style preferences are NOT grounds for failure. Only fail for substantive errors.
+"""
+
 # --- FILE TYPE CONFIG ---
 FILE_TYPE_CONFIG: dict[str, dict[str, Any]] = {
     "excel": {"ext": ".xlsx", "system_prompt": EXCEL_SYSTEM_PROMPT, "modify_system_prompt": EXCEL_MODIFY_SYSTEM_PROMPT, "label": "Excel"},
     "docx":  {"ext": ".docx", "system_prompt": DOCX_SYSTEM_PROMPT, "modify_system_prompt": DOCX_MODIFY_SYSTEM_PROMPT, "label": "Word"},
+    "csv":   {"ext": ".csv", "label": "CSV"},
 }
 
 # --- HELPER FUNCTIONS ---
@@ -251,6 +315,54 @@ async def run_code_in_subprocess(code: str, file_path: str, input_file_path: str
             pass
 
 
+async def run_analysis_code(code: str, input_file_path: str) -> str:
+    """Run pandas analysis code in an isolated subprocess and return stdout.
+
+    Similar to run_code_in_subprocess but returns captured stdout text
+    instead of writing to an output file.  Raises RuntimeError on failure.
+    """
+    cleaned = re.sub(r"(?m)^input_file_path\s*=\s*.+$", "", code)
+    script_content = f"input_file_path = {input_file_path!r}\n{cleaned}"
+    script_path = os.path.join(STORAGE_DIR, f"_analysis_{uuid.uuid4().hex[:8]}.py")
+    log.info(f"Writing analysis script to {script_path}")
+    log.debug(f"Analysis script content:\n{script_content}")
+    try:
+        with open(script_path, "w") as f:
+            f.write(script_content)
+
+        safe_env = {"PATH": os.getenv("PATH", "/usr/bin:/usr/local/bin")}
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, script_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=safe_env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=SCRIPT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"Analysis script timed out after {SCRIPT_TIMEOUT} seconds")
+
+        stdout_text = stdout.decode() if stdout else ""
+        stderr_text = stderr.decode() if stderr else ""
+
+        log.info(f"Analysis subprocess exited with code {proc.returncode}")
+        if stdout_text:
+            log.debug(f"[analysis stdout] {stdout_text[:500]}")
+        if proc.returncode != 0:
+            raise RuntimeError(stderr_text.strip() or f"Script exited with code {proc.returncode}")
+
+        return stdout_text
+    finally:
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+
+
 async def upload_file(local_path: str, filename: str) -> str:
     """Upload a generated file to Open WebUI and return a public download URL.
 
@@ -289,13 +401,15 @@ async def upload_file(local_path: str, filename: str) -> str:
 
 
 # Extension-to-file-type mapping (reverse of FILE_TYPE_CONFIG)
-_EXT_TO_FILE_TYPE = {".xlsx": "excel", ".xls": "excel", ".docx": "docx"}
+_EXT_TO_FILE_TYPE = {".xlsx": "excel", ".xls": "excel", ".docx": "docx", ".csv": "csv"}
 
 # Content-Type to file type mapping
 _CONTENT_TYPE_TO_FILE_TYPE = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "excel",
     "application/vnd.ms-excel": "excel",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "text/csv": "csv",
+    "application/csv": "csv",
 }
 
 
@@ -387,9 +501,10 @@ async def generate_file(
     """
 
     # 0. Validate file_type
-    if file_type not in FILE_TYPE_CONFIG:
+    if file_type not in FILE_TYPE_CONFIG or "system_prompt" not in FILE_TYPE_CONFIG.get(file_type, {}):
+        supported = [k for k, v in FILE_TYPE_CONFIG.items() if "system_prompt" in v]
         raise ToolError(
-            f"Unsupported file_type '{file_type}'. Must be one of: {', '.join(FILE_TYPE_CONFIG)}"
+            f"Unsupported file_type '{file_type}'. Must be one of: {', '.join(supported)}"
         )
     config = FILE_TYPE_CONFIG[file_type]
 
@@ -481,6 +596,12 @@ async def modify_file(
 
     config = FILE_TYPE_CONFIG[file_type]
 
+    if "modify_system_prompt" not in config:
+        raise ToolError(
+            f"File type '{config['label']}' is not supported for modification. "
+            f"Use analyze_file instead for CSV data."
+        )
+
     # 1. Setup output path
     filename = f"{filename_hint}_{uuid.uuid4().hex[:8]}{config['ext']}"
     file_path = os.path.join(STORAGE_DIR, filename)
@@ -555,6 +676,233 @@ async def modify_file(
             os.remove(input_file_path)
         except OSError:
             pass
+
+
+@mcp.tool
+async def analyze_file(
+    file_id: str,
+    instructions: str,
+) -> str:
+    """Analyze a CSV or Excel file using natural language instructions.
+
+    Downloads the file from Open WebUI by file_id, runs an agentic loop
+    where an LLM generates and executes pandas analysis code across multiple
+    rounds, then a checker sub-agent verifies the results. Returns natural
+    language analysis results followed by an audit trail of steps and code.
+
+    Args:
+        file_id: The Open WebUI file ID of the file to analyze.
+        instructions: Natural language description of the analysis to perform.
+    """
+
+    # 0. Download the file and validate type
+    try:
+        input_file_path, file_type = await download_file(file_id)
+    except RuntimeError as e:
+        raise ToolError(f"Failed to download file: {e}")
+
+    if file_type not in ("csv", "excel"):
+        # Clean up before raising
+        try:
+            os.remove(input_file_path)
+        except OSError:
+            pass
+        raise ToolError(
+            f"File type '{FILE_TYPE_CONFIG.get(file_type, {}).get('label', file_type)}' "
+            f"is not supported for analysis. Only CSV and Excel files are supported."
+        )
+
+    log.info(f"=== New analysis request: '{instructions}' | file: {input_file_path} (type: {file_type}) ===")
+
+    max_rounds = 3
+    max_error_retries = 2
+    steps: list[dict[str, str]] = []  # {"code": ..., "output": ...}
+
+    try:
+        # --- AGENTIC ANALYSIS LOOP ---
+        for round_num in range(max_rounds):
+            log.info(f"--- Analysis round {round_num + 1}/{max_rounds} ---")
+
+            if round_num == 0:
+                # First round: fresh code generation
+                messages = [
+                    {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Analyze this file according to these instructions: {instructions}"},
+                ]
+            else:
+                # Subsequent rounds: include prior steps, ask LLM to continue or stop
+                steps_text = ""
+                for i, step in enumerate(steps, 1):
+                    steps_text += f"\n--- Step {i} Code ---\n{step['code']}\n--- Step {i} Output ---\n{step['output']}\n"
+
+                messages = [
+                    {"role": "system", "content": ANALYSIS_FOLLOWUP_SYSTEM_PROMPT},
+                    {"role": "user", "content": (
+                        f"Original instructions: {instructions}\n\n"
+                        f"Here are the analysis steps completed so far:\n{steps_text}\n\n"
+                        f"Should more analysis be done, or is this complete?"
+                    )},
+                ]
+
+            # Generate code (or completion signal)
+            log.info(f"Calling LLM for analysis round {round_num + 1}...")
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.01,
+            )
+            raw = response.choices[0].message.content
+            log.debug(f"LLM response (round {round_num + 1}):\n{raw}")
+
+            # Check for completion signal
+            if "__ANALYSIS_COMPLETE__" in raw:
+                log.info(f"LLM signaled analysis complete at round {round_num + 1}")
+                break
+
+            code = extract_code(raw)
+
+            # Execute with error retries
+            output = None
+            last_error = ""
+            for retry in range(max_error_retries + 1):
+                try:
+                    output = await run_analysis_code(code, input_file_path)
+                    break
+                except RuntimeError as e:
+                    last_error = str(e)
+                    log.warning(f"Analysis code failed (retry {retry + 1}): {last_error}")
+                    if retry < max_error_retries:
+                        # Ask LLM to fix the code
+                        fix_messages = [
+                            {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                            {"role": "user", "content": (
+                                f"The previous analysis code failed.\n\n"
+                                f"USER INSTRUCTIONS: {instructions}\n\n"
+                                f"FAILED CODE:\n{code}\n\n"
+                                f"ERROR MESSAGE:\n{last_error}\n\n"
+                                f"Rewrite the code to fix this error. "
+                                f"Ensure you still use `input_file_path`."
+                            )},
+                        ]
+                        fix_response = await client.chat.completions.create(
+                            model=MODEL_NAME,
+                            messages=fix_messages,
+                            temperature=0.01,
+                        )
+                        code = extract_code(fix_response.choices[0].message.content)
+
+            if output is None:
+                log.error(f"Round {round_num + 1}: all error retries exhausted. Last error: {last_error}")
+                raise ToolError(
+                    f"Analysis code failed after {max_error_retries + 1} attempts. "
+                    f"Last error: {last_error}"
+                )
+
+            steps.append({"code": code, "output": output})
+            log.info(f"Round {round_num + 1} complete. Output length: {len(output)} chars")
+
+        if not steps:
+            raise ToolError("Analysis produced no results. The LLM did not generate any code.")
+
+        # --- SUB-AGENT CHECKER ---
+        analysis_result = await _run_checker(instructions, steps)
+
+        # If checker failed, redo once with feedback
+        if analysis_result.startswith("__CHECK_FAILED__"):
+            checker_feedback = analysis_result[len("__CHECK_FAILED__"):].strip()
+            log.info(f"Checker flagged issues, running one redo. Feedback: {checker_feedback[:200]}")
+
+            redo_steps = await _run_analysis_redo(instructions, checker_feedback, input_file_path, steps)
+            if redo_steps:
+                steps.extend(redo_steps)
+            # Re-check (accept whatever comes out)
+            analysis_result = await _run_checker(instructions, steps)
+            if analysis_result.startswith("__CHECK_FAILED__"):
+                # Accept anyway on second pass — strip the marker
+                analysis_result = analysis_result[len("__CHECK_FAILED__"):].strip()
+            elif analysis_result.startswith("__CHECK_PASSED__"):
+                analysis_result = analysis_result[len("__CHECK_PASSED__"):].strip()
+        elif analysis_result.startswith("__CHECK_PASSED__"):
+            analysis_result = analysis_result[len("__CHECK_PASSED__"):].strip()
+
+        # --- FORMAT OUTPUT ---
+        methodology = ""
+        for i, step in enumerate(steps, 1):
+            methodology += f"\n### Step {i}\n**Code:**\n```python\n{step['code']}\n```\n**Output:**\n```\n{step['output']}\n```\n"
+
+        return (
+            f"## Analysis Results\n\n{analysis_result}\n\n"
+            f"---\n\n## Methodology\n{methodology}"
+        )
+
+    finally:
+        try:
+            os.remove(input_file_path)
+        except OSError:
+            pass
+
+
+async def _run_checker(instructions: str, steps: list[dict[str, str]]) -> str:
+    """Run the sub-agent checker on analysis results."""
+    steps_text = ""
+    for i, step in enumerate(steps, 1):
+        steps_text += f"\n--- Step {i} Code ---\n{step['code']}\n--- Step {i} Output ---\n{step['output']}\n"
+
+    messages = [
+        {"role": "system", "content": ANALYSIS_CHECKER_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"Original instructions: {instructions}\n\n"
+            f"Analysis steps:\n{steps_text}"
+        )},
+    ]
+    log.info("Running analysis checker sub-agent...")
+    response = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.01,
+    )
+    result = response.choices[0].message.content.strip()
+    log.debug(f"Checker result:\n{result[:500]}")
+    return result
+
+
+async def _run_analysis_redo(
+    instructions: str,
+    checker_feedback: str,
+    input_file_path: str,
+    prior_steps: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Re-run analysis with checker feedback. Returns new steps."""
+    prior_text = ""
+    for i, step in enumerate(prior_steps, 1):
+        prior_text += f"\n--- Step {i} Code ---\n{step['code']}\n--- Step {i} Output ---\n{step['output']}\n"
+
+    messages = [
+        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"Analyze this file according to these instructions: {instructions}\n\n"
+            f"A reviewer found these issues with the previous analysis:\n{checker_feedback}\n\n"
+            f"Previous analysis steps for context:\n{prior_text}\n\n"
+            f"Write corrected analysis code that addresses the reviewer's feedback."
+        )},
+    ]
+    log.info("Running analysis redo based on checker feedback...")
+    response = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.01,
+    )
+    code = extract_code(response.choices[0].message.content)
+
+    new_steps = []
+    try:
+        output = await run_analysis_code(code, input_file_path)
+        new_steps.append({"code": code, "output": output})
+    except RuntimeError as e:
+        log.error(f"Redo analysis code failed: {e}")
+        # Return empty — the original steps are still used
+
+    return new_steps
 
 
 # --- HEALTH CHECK ---
