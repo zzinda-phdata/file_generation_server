@@ -1,16 +1,48 @@
 # OpenWebUI File Agent
 
-A FastAPI service that generates Excel (`.xlsx`) and Word (`.docx`) files from natural language instructions. It uses an LLM to write Python code, executes it in a sandboxed subprocess, and uploads the result to Open WebUI.
+An MCP (Model Context Protocol) tool server built with FastMCP that generates and modifies Excel (`.xlsx`) and Word (`.docx`) files from natural language instructions. It uses an LLM to write Python code, executes it in a sandboxed subprocess, and uploads the result to Open WebUI. Open WebUI connects to this server natively as an MCP tool server via Streamable HTTP transport.
 
 ## How It Works
 
-1. You send a natural language instruction (e.g. *"Create a quarterly budget spreadsheet"*)
-2. The service asks an LLM to generate Python code using `xlsxwriter` or `python-docx`
-3. The code runs in an isolated subprocess (no access to API keys)
-4. The resulting file is uploaded to Open WebUI
-5. You get back a download URL
+**Creating a file:**
+1. You ask for a file in natural language (e.g. *"Create a quarterly budget spreadsheet"*)
+2. Open WebUI calls the `generate_file` MCP tool
+3. The server asks an LLM to generate Python code using `xlsxwriter` (Excel) or `python-docx` (Word)
+4. The code runs in an isolated subprocess (no access to API keys)
+5. The resulting file is uploaded to Open WebUI
+6. You get back a download URL
 
-If the generated code fails, the service automatically retries up to 3 times, feeding the error back to the LLM for self-correction.
+**Modifying a file:**
+1. You ask to modify an existing file (e.g. *"Add a totals row to this spreadsheet"*)
+2. Open WebUI calls the `modify_file` MCP tool with the file ID
+3. The server downloads the original file, then asks an LLM to generate modification code using `openpyxl` (Excel) or `python-docx` (Word)
+4. The code runs in an isolated subprocess
+5. The modified file is uploaded to Open WebUI
+6. You get back a download URL
+
+If the generated code fails, the server automatically retries up to 3 times, feeding the error back to the LLM for self-correction.
+
+## MCP Tools
+
+### `generate_file`
+
+Create a new Excel or Word file from scratch.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `instructions` | string | *(required)* | Natural language description of the file to generate |
+| `file_type` | string | `"excel"` | `"excel"` for `.xlsx` or `"docx"` for `.docx` |
+| `filename_hint` | string | `"output"` | Base filename (a UUID suffix is added automatically) |
+
+### `modify_file`
+
+Modify an existing Excel or Word file.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `file_id` | string | *(required)* | The Open WebUI file ID of the file to modify |
+| `instructions` | string | *(required)* | Natural language description of the modifications to make |
+| `filename_hint` | string | `"modified"` | Base filename (a UUID suffix is added automatically) |
 
 ## Prerequisites
 
@@ -21,7 +53,7 @@ If the generated code fails, the service automatically retries up to 3 times, fe
 ## Quick Start
 
 ```bash
-# 1. Clone the repository and navigate to
+# 1. Clone the repository and navigate to it
 git clone <repo-url> && cd my_local_directory
 
 # 2. Create your .env from the template
@@ -33,12 +65,20 @@ cp .sample_env .env
 docker compose up --build
 ```
 
-The service starts on **port 8000**. Verify it's running:
+The server starts on **port 8000**. The MCP endpoint is at `http://localhost:8000/mcp`.
+
+Verify it's running:
 
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
+
+## Open WebUI Setup
+
+1. Go to **Admin Settings > Tools > MCP Servers**
+2. Add server URL: `http://host.docker.internal:8000/mcp` (if both run in Docker) or `http://localhost:8000/mcp` (if File Agent runs on host)
+3. The `generate_file` and `modify_file` tools should appear in the chat tool list
 
 ## Configuration
 
@@ -69,44 +109,7 @@ OPENWEBUI_API_KEY=sk-your-openwebui-key-here
 | `PUBLIC_DOMAIN` | Open WebUI URL **from the user's browser** (for download links) |
 | `OPENWEBUI_API_KEY` | Open WebUI API key for file uploads |
 
-## API Endpoints
-
-### `POST /generate-file`
-
-The primary endpoint. Generates a file from natural language instructions.
-
-**Request:**
-
-```json
-{
-  "instructions": "Create a monthly budget spreadsheet with categories for rent, utilities, food, and savings",
-  "file_type": "excel",
-  "filename_hint": "budget"
-}
-```
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `instructions` | string | *(required)* | Natural language description of the file to generate |
-| `file_type` | string | `"excel"` | `"excel"` for `.xlsx` or `"docx"` for `.docx` |
-| `filename_hint` | string | `"output"` | Base filename (a UUID suffix is added automatically) |
-
-**Response:**
-
-```json
-{
-  "status": "success",
-  "download_url": "http://localhost:8080/api/v1/files/abc123/content",
-  "message": "Excel file generated successfully.",
-  "attempts": 1
-}
-```
-
-### `GET /health`
-
-Returns `{"status": "ok"}` if the service is running.
-
-For development:
+## Development
 
 ```bash
 pip install -r requirements.txt
@@ -124,10 +127,9 @@ This starts a single Uvicorn worker on port 8000. For production, use Docker whi
 | `"Cannot connect to host localhost"` | Docker networking misconfiguration | Use `host.docker.internal` for `INTERNAL_API_URL` |
 | Upload returns 401 | Invalid or missing Open WebUI API key | Regenerate key in Open WebUI Settings > Account > API Keys |
 | Packages not found in subprocess | Wrong Python interpreter | Check the startup log `Python executable = ...` |
+| `"Cannot determine file type"` | Unrecognized file in modify_file | Check debug logs for raw response headers |
 
 ## Sample Conversations and Outputs
-
-<!-- TODO: Add screenshots of sample conversations -->
 
 ### Excel Generation
 

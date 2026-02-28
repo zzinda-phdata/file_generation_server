@@ -2,7 +2,7 @@
 
 ## What This Is
 
-An MCP (Model Context Protocol) tool server built with FastMCP that takes natural language instructions, uses an LLM to generate Python code (xlsxwriter for Excel, python-docx for Word), executes it in a sandboxed subprocess, and uploads the resulting file to Open WebUI. Open WebUI connects to this server natively as an MCP tool server via Streamable HTTP transport.
+An MCP (Model Context Protocol) tool server built with FastMCP that generates and modifies Excel/Word files via natural language. It uses an LLM to generate Python code (xlsxwriter/openpyxl for Excel, python-docx for Word), executes it in a sandboxed subprocess, and uploads the resulting file to Open WebUI. Open WebUI connects to this server natively as an MCP tool server via Streamable HTTP transport.
 
 ## Architecture
 
@@ -12,20 +12,30 @@ Open WebUI  -->  MCP tool call: generate_file()  -->  LLM generates Python code
                                                   -->  Code runs in isolated subprocess
                                                   -->  .xlsx/.docx uploaded to Open WebUI
                                                   -->  Download URL returned as text
+
+Open WebUI  -->  MCP tool call: modify_file()    -->  Download existing file from Open WebUI
+                 (Streamable HTTP at /mcp)        -->  LLM generates Python code (openpyxl or python-docx)
+                                                  -->  Code runs in isolated subprocess
+                                                  -->  Modified .xlsx/.docx uploaded to Open WebUI
+                                                  -->  Download URL returned as text
 ```
 
 Single file app (`main.py`) with these key components:
 
 - **`generate_code()`** — Calls LLM (OpenAI-compatible API) to produce raw Python code using the appropriate system prompt
 - **`extract_code()`** — Strips markdown fences if LLM ignores formatting rules
-- **`run_code_in_subprocess()`** — Executes LLM code in a subprocess with a stripped environment (no API keys), enforced timeout, and `file_path` reassignment stripping
+- **`run_code_in_subprocess()`** — Executes LLM code in a subprocess with a stripped environment (no API keys), enforced timeout, and `file_path`/`input_file_path` reassignment stripping
 - **`upload_file()`** — Async upload to Open WebUI's `/api/v1/files/` endpoint via aiohttp
-- **`generate_file()`** — The MCP tool; orchestrates a self-healing retry loop (up to 3 retries) for any supported file type
-- **`FILE_TYPE_CONFIG`** — Dict mapping file types to their extension, system prompt, and label
+- **`download_file()`** — Async download from Open WebUI's `/api/v1/files/{id}/content` endpoint; detects file type from response headers
+- **`generate_file()`** — MCP tool for creating new files; orchestrates a self-healing retry loop (up to 3 retries)
+- **`modify_file()`** — MCP tool for modifying existing files; downloads the original, runs a self-healing retry loop, uploads the result
+- **`FILE_TYPE_CONFIG`** — Dict mapping file types to their extension, system prompts (create and modify), and label
 
-## MCP Tool
+## MCP Tools
 
-The server exposes one tool via `@mcp.tool`:
+The server exposes two tools via `@mcp.tool`:
+
+### `generate_file` — Create a new file from scratch
 
 ```
 generate_file(instructions: str, file_type: str = "excel", filename_hint: str = "output") -> str
@@ -37,21 +47,37 @@ generate_file(instructions: str, file_type: str = "excel", filename_hint: str = 
 - Returns a plain string with status and download URL
 - Raises `ToolError` for invalid file types or exhausted retries
 
+### `modify_file` — Modify an existing file
+
+```
+modify_file(file_id: str, instructions: str, filename_hint: str = "modified") -> str
+```
+
+- `file_id` — The Open WebUI file ID of the file to modify
+- `instructions` — Natural language description of the modifications to make
+- `filename_hint` — Base name for the modified file (UUID suffix added automatically)
+- File type is auto-detected from download response headers (Content-Disposition / Content-Type)
+- Returns a plain string with status and download URL
+- Raises `ToolError` for download failures, unrecognized file types, or exhausted retries
+
 ## Supported File Types
 
-| `file_type` | Library | Extension | System Prompt |
-|---|---|---|---|
-| `excel` | xlsxwriter | `.xlsx` | `EXCEL_SYSTEM_PROMPT` |
-| `docx` | python-docx | `.docx` | `DOCX_SYSTEM_PROMPT` |
+| `file_type` | Create Library | Modify Library | Extension | Create Prompt | Modify Prompt |
+|---|---|---|---|---|---|
+| `excel` | xlsxwriter | openpyxl | `.xlsx` | `EXCEL_SYSTEM_PROMPT` | `EXCEL_MODIFY_SYSTEM_PROMPT` |
+| `docx` | python-docx | python-docx | `.docx` | `DOCX_SYSTEM_PROMPT` | `DOCX_MODIFY_SYSTEM_PROMPT` |
+
+**Note**: xlsxwriter is write-only and cannot read existing files. The modification flow uses openpyxl, which can both read and write `.xlsx` files.
 
 ## Key Design Decisions
 
 - **FastMCP with `stateless_http=True`**: Passed to `mcp.http_app()`. Each MCP request is independent — no session state. Safe with multiple gunicorn workers for concurrent multi-user support.
-- **Single MCP tool**: `generate_file()` handles all file types via the `file_type` parameter and `FILE_TYPE_CONFIG` lookup. Adding a new file type requires only a new system prompt and config entry.
+- **Two MCP tools**: `generate_file()` creates new files from scratch; `modify_file()` downloads and modifies existing files. Both use `FILE_TYPE_CONFIG` for type-specific behavior. Adding a new file type requires a create prompt, a modify prompt, and a config entry.
 - **ASGI export**: `app = mcp.http_app(path="/mcp")` exports a Starlette ASGI app. Gunicorn/uvicorn serve it the same way they served the old FastAPI app.
 - **Subprocess sandboxing**: LLM-generated code runs via `asyncio.create_subprocess_exec(sys.executable, script_path)` with `env={"PATH": ...}` only. This prevents the generated code from accessing API keys or server env vars.
 - **`sys.executable`** is used instead of `"python"` so the subprocess uses the same interpreter (and installed packages) as the app.
-- **`file_path` stripping**: LLMs often redefine `file_path` in generated code despite instructions not to. A regex strips `file_path = ...` lines before prepending the correct assignment.
+- **`file_path` / `input_file_path` stripping**: LLMs often redefine path variables in generated code despite instructions not to. Regexes strip `file_path = ...` and `input_file_path = ...` lines before prepending the correct assignments.
+- **Two-path subprocess design**: The modification flow injects both `input_file_path` (read-only original) and `file_path` (output) into the subprocess. This keeps the original intact for retry safety — only the output file is deleted between attempts.
 - **Non-root Docker user**: The container runs as `appuser`, not root.
 - **Gunicorn timeout**: Set to 300s to accommodate complex prompts that require multiple LLM round-trips.
 
@@ -75,7 +101,7 @@ Uses Gunicorn with 4 Uvicorn workers. Environment variables loaded from `.env` v
 
 1. Go to **Admin Settings > Tools > MCP Servers**
 2. Add server URL: `http://host.docker.internal:8000/mcp` (if both run in Docker) or `http://localhost:8000/mcp` (if File Agent runs on host)
-3. The `generate_file` tool should appear in the chat tool list
+3. The `generate_file` and `modify_file` tools should appear in the chat tool list
 
 ## Verification
 
@@ -114,7 +140,7 @@ Configured in `.env` (gitignored). See `.sample_env` for the template.
 | `main.py` | Entire application |
 | `Dockerfile` | Python 3.11-slim, non-root user, Gunicorn |
 | `compose.yaml` | Docker Compose config, loads `.env` |
-| `requirements.txt` | Python dependencies (fastmcp, xlsxwriter, python-docx, etc.) |
+| `requirements.txt` | Python dependencies (fastmcp, xlsxwriter, openpyxl, python-docx, etc.) |
 | `.env` | Real config (gitignored) |
 | `.sample_env` | Template for `.env` |
 | `.gitignore` | Excludes `.env` |
@@ -128,3 +154,5 @@ Configured in `.env` (gitignored). See `.sample_env` for the template.
 - **Packages not found in subprocess**: Ensure `sys.executable` points to the right Python. Check the startup log line `Python executable = ...`.
 - **Logging not visible**: The logger uses a dedicated `StreamHandler` on stderr to avoid being overridden by Uvicorn's logging setup.
 - **MCP tool not appearing in Open WebUI**: Verify the MCP handshake works (see Verification section). Check that the server URL in Open WebUI settings matches the actual endpoint.
+- **"Cannot determine file type" in modify_file**: Open WebUI's response headers didn't include a recognizable filename extension or Content-Type. Check the debug logs for the raw headers.
+- **Old `.xls` format not supported for modification**: openpyxl only supports `.xlsx` (Office Open XML). Legacy `.xls` files (Excel 97-2003) are not supported.
