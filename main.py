@@ -42,6 +42,9 @@ client = AsyncOpenAI(
     timeout=120.0,
 )
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
+DEEP_RESEARCH_MODEL = os.getenv("DEEP_RESEARCH_MODEL", "o4-mini-deep-research")
+DEEP_RESEARCH_POLL_INTERVAL = 5   # seconds between status checks
+DEEP_RESEARCH_TIMEOUT = 600       # max seconds to wait for completion
 
 # --- SYSTEM PROMPTS ---
 EXCEL_SYSTEM_PROMPT = """
@@ -1088,6 +1091,123 @@ async def _run_analysis_redo(
         new_steps.append({"code": code, "output": f"EXECUTION FAILED: {e}", "duration_s": 0})
 
     return new_steps
+
+
+@mcp.tool
+async def conduct_deep_research(
+    instructions: str,
+) -> str:
+    """Conduct deep research on a topic using web search and synthesis.
+
+    Uses the OpenAI Responses API with the o4-mini-deep-research model to
+    search and synthesize hundreds of web sources into a comprehensive
+    research report. This can take several minutes to complete.
+
+    Args:
+        instructions: Natural language description of the research to conduct.
+    """
+    log.info(f"=== New deep research request: '{instructions[:100]}' ===")
+    t0 = time.monotonic()
+
+    # 1. Create background research task
+    try:
+        response = await client.responses.create(
+            model=DEEP_RESEARCH_MODEL,
+            input=instructions,
+            background=True,
+            tools=[{"type": "web_search_preview"}],
+        )
+    except (APIError, APIConnectionError, RateLimitError) as e:
+        log.error(f"Deep research API call failed: {e}")
+        raise ToolError(f"Failed to start deep research: {e}")
+
+    response_id = response.id
+    log.info(f"Deep research created: id={response_id}, status={response.status}")
+
+    # 2. Poll for completion
+    last_status = response.status
+    while response.status in ("queued", "in_progress"):
+        if time.monotonic() - t0 > DEEP_RESEARCH_TIMEOUT:
+            log.error(f"Deep research timed out after {DEEP_RESEARCH_TIMEOUT}s (id={response_id})")
+            raise ToolError(
+                f"Deep research timed out after {DEEP_RESEARCH_TIMEOUT} seconds. "
+                f"The research may still be running — try again later."
+            )
+
+        await asyncio.sleep(DEEP_RESEARCH_POLL_INTERVAL)
+
+        try:
+            response = await client.responses.retrieve(response_id)
+        except (APIError, APIConnectionError, RateLimitError) as e:
+            log.warning(f"Poll failed (will retry): {e}")
+            continue
+
+        if response.status != last_status:
+            elapsed = time.monotonic() - t0
+            log.info(f"Deep research status: {last_status} -> {response.status} ({elapsed:.0f}s elapsed)")
+            last_status = response.status
+
+    elapsed = time.monotonic() - t0
+    log.info(f"Deep research finished: status={response.status}, elapsed={elapsed:.1f}s")
+
+    # 3. Handle terminal status
+    if response.status != "completed":
+        # Extract error details from the response
+        error_detail = ""
+        try:
+            # The API may include error info in various places
+            if hasattr(response, "error") and response.error:
+                error_detail = str(response.error)
+            elif hasattr(response, "last_error") and response.last_error:
+                error_detail = str(response.last_error)
+            elif hasattr(response, "incomplete_details") and response.incomplete_details:
+                error_detail = str(response.incomplete_details)
+            # Also dump output items for clues
+            if hasattr(response, "output") and response.output:
+                for item in response.output:
+                    log.info(f"Response output item: type={getattr(item, 'type', '?')}, content={str(item)[:300]}")
+        except Exception:
+            pass
+        log.error(f"Deep research failed: status={response.status}, error={error_detail}, response_id={response_id}")
+        log.debug(f"Full failed response: {response}")
+        raise ToolError(
+            f"Deep research ended with status '{response.status}' after {elapsed:.0f}s. "
+            f"{f'Error: {error_detail}. ' if error_detail else ''}"
+            f"Please try again."
+        )
+
+    # 4. Extract results
+    report = response.output_text or ""
+    if not report:
+        raise ToolError("Deep research completed but returned no output.")
+
+    # 5. Extract source citations from annotations
+    sources = []
+    try:
+        for item in response.output:
+            if hasattr(item, "content"):
+                for block in item.content:
+                    if hasattr(block, "annotations"):
+                        for ann in block.annotations:
+                            url = getattr(ann, "url", None)
+                            title = getattr(ann, "title", None)
+                            if url and url not in [s["url"] for s in sources]:
+                                sources.append({"url": url, "title": title or url})
+    except Exception:
+        log.debug("Could not extract annotations from response", exc_info=True)
+
+    # 6. Format output
+    result = f"## Deep Research Report\n\n{report}"
+
+    if sources:
+        result += "\n\n---\n\n## Sources\n"
+        for src in sources:
+            result += f"- [{src['title']}]({src['url']})\n"
+
+    result += f"\n---\n*Completed in {elapsed:.0f}s*"
+
+    log.info(f"Deep research complete: {len(report)} chars, {len(sources)} sources, {elapsed:.1f}s")
+    return result
 
 
 # --- HEALTH CHECK ---

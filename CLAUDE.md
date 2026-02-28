@@ -25,6 +25,12 @@ Open WebUI  -->  MCP tool call: analyze_file()   -->  Download existing file fro
                                                   -->  Output fed back to LLM for next round
                                                   -->  Checker sub-agent verifies results
                                                   -->  Analysis text returned (no file upload)
+
+Open WebUI  -->  MCP tool call: conduct_deep_research()  -->  OpenAI Responses API
+                 (Streamable HTTP at /mcp)                -->  o4-mini-deep-research model
+                                                          -->  Web search across hundreds of sources
+                                                          -->  Background polling until complete
+                                                          -->  Research report returned as text
 ```
 
 Single file app (`main.py`) with these key components:
@@ -44,11 +50,12 @@ Single file app (`main.py`) with these key components:
 - **`analyze_file()`** — MCP tool for analyzing CSV/Excel files; runs data inspection, then agentic multi-round loop with checker sub-agent. Returns analysis results with QA section and full methodology audit trail (including timing).
 - **`_run_checker()`** — Sub-agent that verifies analysis results; returns `(status, content)` where status is `'passed'`, `'failed'`, or `'unknown'`
 - **`_run_analysis_redo()`** — Re-runs analysis with checker feedback when the checker flags issues. Records failed execution attempts in the audit trail instead of silently dropping them.
+- **`conduct_deep_research()`** — MCP tool for deep research; uses the OpenAI Responses API with `o4-mini-deep-research` model and web search. Polls for completion in background mode. Returns research report with source citations.
 - **`FILE_TYPE_CONFIG`** — Dict mapping file types to their extension, system prompts (create and modify), and label
 
 ## MCP Tools
 
-The server exposes three tools via `@mcp.tool`:
+The server exposes four tools via `@mcp.tool`:
 
 ### `generate_file` — Create a new file from scratch
 
@@ -90,6 +97,19 @@ analyze_file(file_id: str, instructions: str) -> str
 - Returns: Analysis Results section, Quality Assurance section (checker status, round count, timing), and Methodology section (data inspection + all code and outputs with execution timing) for auditability
 - Raises `ToolError` for download failures, unsupported file types, or failed analysis
 
+### `conduct_deep_research` — Research a topic using web search
+
+```
+conduct_deep_research(instructions: str) -> str
+```
+
+- `instructions` — Natural language description of the research to conduct
+- Uses the OpenAI Responses API with `o4-mini-deep-research` model and web search
+- Runs in background mode with polling (can take several minutes)
+- Returns a research report with inline citations and a sources list
+- Raises `ToolError` for API failures, timeouts (`DEEP_RESEARCH_TIMEOUT`, default 600s), or empty results
+- **Note**: This tool requires the OpenAI API (not compatible with alternative providers like Ollama/vLLM)
+
 ## Supported File Types
 
 | `file_type` | Create Library | Modify Library | Extension | Create Prompt | Modify Prompt |
@@ -117,6 +137,7 @@ analyze_file(file_id: str, instructions: str) -> str
 - **QA section**: The analysis output includes a Quality Assurance section showing checker status (PASSED / PASSED after correction / ACCEPTED WITH CAVEATS), round count, execution timing, and a note if max rounds were reached without explicit completion.
 - **Stderr warnings**: `run_analysis_code()` appends meaningful stderr warnings (filtering out FutureWarning/DeprecationWarning noise) to the returned output. This helps the LLM see and fix pandas warnings in subsequent rounds.
 - **Analysis returns text, not files**: Unlike `generate_file` and `modify_file`, `analyze_file` captures subprocess stdout and returns it as text. It does not upload any files.
+- **Deep research via Responses API**: `conduct_deep_research` uses a completely different API surface (`client.responses.create()` with `background=True`) from the other tools. The initial API call returns immediately; the tool then polls `client.responses.retrieve()` every 5 seconds until completion. Status transitions are logged. Resilient to transient poll failures (logs warning and continues). Citations are extracted from response annotations.
 - **Non-root Docker user**: The container runs as `appuser`, not root.
 - **Gunicorn timeout**: Set to 300s to accommodate complex prompts that require multiple LLM round-trips.
 
@@ -166,6 +187,9 @@ Configured in `.env` (gitignored). See `.sample_env` for the template.
 | `OPENAI_BASE_URL` | LLM endpoint (OpenAI, Ollama, vLLM, etc.) | `https://api.openai.com/v1` |
 | `MODEL_NAME` | Model to use for code generation | `gpt-4o` |
 | `SCRIPT_TIMEOUT` | Max seconds for subprocess execution | `90` |
+| `DEEP_RESEARCH_MODEL` | Model for deep research tool | `o4-mini-deep-research` |
+| `DEEP_RESEARCH_POLL_INTERVAL` | Seconds between status checks (hardcoded) | `5` |
+| `DEEP_RESEARCH_TIMEOUT` | Max seconds to wait for deep research (hardcoded) | `600` |
 | `INTERNAL_API_URL` | Open WebUI URL from inside the container | `http://localhost:8080` |
 | `PUBLIC_DOMAIN` | Open WebUI URL from the browser (for download links) | `http://localhost:8080` |
 | `OPENWEBUI_API_KEY` | Open WebUI API key for file uploads | — |
@@ -197,3 +221,6 @@ Configured in `.env` (gitignored). See `.sample_env` for the template.
 - **Old `.xls` format not supported for modification**: openpyxl only supports `.xlsx` (Office Open XML). Legacy `.xls` files (Excel 97-2003) are not supported.
 - **"not supported for analysis"**: `analyze_file` only supports CSV and Excel files. Word documents cannot be analyzed.
 - **Analysis timeout**: Multi-round analysis involves up to 3 subprocess runs + 5+ LLM calls. Ensure gunicorn timeout (300s) is sufficient. Increase if complex analyses time out.
+- **Deep research timeout**: `conduct_deep_research` can take several minutes. The tool polls in background mode so the HTTP client timeout (120s) is not an issue, but the gunicorn worker timeout (300s) may need to be increased to 600s+ for long research tasks. The tool's own timeout is `DEEP_RESEARCH_TIMEOUT` (default 600s).
+- **Deep research with non-OpenAI providers**: `conduct_deep_research` uses the OpenAI Responses API which is only available at `api.openai.com`. If `OPENAI_BASE_URL` points to a different provider, this tool will fail. The other tools (generate_file, modify_file, analyze_file) work with any OpenAI-compatible provider.
+- **"'AsyncOpenAI' object has no attribute 'responses'"**: The openai Python SDK must be >= 1.75 for the Responses API. Run `pip install --upgrade openai` or check `requirements.txt`.
